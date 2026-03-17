@@ -1,0 +1,1276 @@
+# ============================================================
+# TAFA: Tangent-Accelerated Field Axion
+# Single-cell version (old code + Option B + scale-aware growth + plots)
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import solve_ivp
+import json
+import traceback
+from dataclasses import dataclass, asdict
+from typing import Dict, Any, Optional
+import warnings
+warnings.filterwarnings('ignore')
+
+
+# ============================================================
+# MODEL
+# ============================================================
+
+class TAFAAxion:
+    """
+    TAFA: Tangent-Accelerated Field Axion with
+      - optional soft-wall deformation (soft_alpha),
+      - effective sound speed control (cs2) for perturbations (Option B),
+      - scale-aware growth ODE (switches on DE clustering below DE sound horizon).
+
+    Potential:
+        V(φ) = Λ^4 * tan^2(φ/2f)                           (soft_alpha = 0)
+        V(φ) = Λ^4 * tan^2(φ/2f) / (1 + α tan^2(φ/2f))     (soft_alpha = α > 0)
+    """
+
+    def __init__(self,
+                 f=0.5, Lambda4=1.316, phi0_pi=0.7,
+                 H0=67.4, Omega_m=0.315,
+                 Gamma0=0.0, n_steps=8000,
+                 # --- wall handling ---
+                 soft_alpha=0.0, eps_wall=1e-3,
+                 # --- solver controls for background ---
+                 method='DOP853', rtol=1e-10, atol=1e-12, max_step=0.02,
+                 # --- Option B: perturbation dial ---
+                 cs2=0.90):
+        # Parameters
+        self.f         = float(f)
+        self.Lambda4   = float(Lambda4)
+        self.phi0      = float(phi0_pi) * np.pi * float(f)   # φ0 = (φ0/π)*π*f
+        self.H0        = float(H0)
+        self.Om        = float(Omega_m)
+        self.n_steps   = int(n_steps)
+
+        # Soft-wall deformation
+        self.soft_alpha = float(soft_alpha)
+        self._eps       = float(eps_wall)
+
+        # Solver options
+        self._method   = method
+        self._rtol     = rtol
+        self._atol     = atol
+        self._max_step = max_step
+
+        # Effective sound speed
+        self.cs2 = float(cs2)
+        if not (0.0 < self.cs2 <= 1.0):
+            raise ValueError(f"cs2 must be in (0,1]; got {self.cs2}")
+
+        # Integrate background immediately
+        self._solve()
+
+    # ---------- safe "u" helper around the wall ----------
+    def _clip_u(self, u):
+        # u = φ/(2f) lives in (-π/2, π/2); keep away from singularity
+        lim = (np.pi/2) - self._eps
+        return np.clip(u, -lim, lim)
+
+    # ---------- Potential and derivatives ----------
+    def V(self, phi):
+        u  = self._clip_u(phi/(2.0*self.f))
+        t2 = np.tan(u)**2
+        if self.soft_alpha > 0.0:
+            return self.Lambda4 * (t2 / (1.0 + self.soft_alpha * t2))
+        else:
+            return self.Lambda4 * t2
+
+    def dV(self, phi):
+        u    = self._clip_u(phi/(2.0*self.f))
+        t    = np.tan(u)
+        sec2 = 1.0/np.cos(u)**2
+        if self.soft_alpha > 0.0:
+            # d/dt (t^2/(1+a t^2)) = 2t / (1 + a t^2)^2
+            dV_dt = self.Lambda4 * 2.0 * t / ((1.0 + self.soft_alpha*(t*t))**2)
+        else:
+            dV_dt = self.Lambda4 * 2.0 * t
+        # chain: dt/du = sec^2(u), du/dφ = 1/(2f)
+        return dV_dt * sec2 * (1.0/(2.0*self.f))
+
+    # ---------- Background H^2 ----------
+    def _H2(self, N, phi, dphidN):
+        a     = np.exp(N)
+        rho_m = self.H0**2 * self.Om * a**(-3)
+        V_val = self.V(phi)
+        # user's trick: 1 - 0.5*(φ'_N)^2 in denominator
+        denom = 1.0 - 0.5 * dphidN**2
+        if denom < 0.05:
+            denom = 0.05
+        H2 = (rho_m + V_val) / denom
+        return max(H2, 1e-30)
+
+    # ---------- Klein-Gordon in N ----------
+    def _eqs(self, N, y):
+        phi, dphidN = y
+        H2     = self._H2(N, phi, dphidN)
+        eps    = 1.5 * dphidN**2
+        d2phi  = -(3.0 - eps) * dphidN - self.dV(phi)/H2
+        return [dphidN, d2phi]
+
+    # ---------- Solve background ----------
+    def _solve(self):
+        N_i    = np.log(1.0/1100.0)  # start near recombination
+        N_f    = 0.0
+        y0     = [self.phi0, 0.0]
+        N_eval = np.linspace(N_i, N_f, self.n_steps)
+
+        sol = solve_ivp(self._eqs, (N_i, N_f), y0,
+                        method=self._method, t_eval=N_eval,
+                        rtol=self._rtol, atol=self._atol, max_step=self._max_step)
+
+        N      = sol.t
+        phi    = sol.y[0]
+        dphidN = sol.y[1]
+        a      = np.exp(N)
+        z      = 1.0/a - 1.0
+
+        H2_arr = np.array([self._H2(N[i], phi[i], dphidN[i]) for i in range(len(N))])
+        H_arr  = np.sqrt(H2_arr)
+
+        dphidt  = H_arr * dphidN
+        KE      = 0.5 * dphidt**2
+        PE      = self.V(phi)
+        rho_phi = KE + PE
+        p_phi   = KE - PE
+        w_arr   = np.where(rho_phi > 1e-30, p_phi/rho_phi, -1.0)
+
+        # Store background
+        self._N, self._a, self._z = N, a, z
+        self._phi, self._dphidN   = phi, dphidN
+        self._H, self._rho, self._w = H_arr, rho_phi, w_arr
+
+    # ---------- CPL fit ----------
+    def compute_cpl(self):
+        mask = self._a > 0.25
+        if mask.sum() < 20:
+            mask = self._a > 0.1
+        a_m = self._a[mask]
+        w_m = self._w[mask]
+        wt  = self._rho[mask]
+        wt  = wt / (wt.sum() + 1e-30)
+        X   = np.column_stack([np.ones_like(a_m), 1.0 - a_m])
+        try:
+            W      = np.diag(wt)
+            XtW    = X.T @ W
+            coeffs = np.linalg.solve(XtW @ X, XtW @ w_m)
+            w0, wa = float(coeffs[0]), float(coeffs[1])
+        except Exception:
+            w0 = float(np.average(w_m, weights=wt))
+            wa = 0.0
+        return w0, wa
+
+    # ---------- |∇V|/V scan ----------
+    def grad_over_V(self, n_phi=300):
+        phi_min = 0.05 * self.f
+        phi_max = (np.pi - self._eps) * self.f * 0.95
+        phi_arr = np.linspace(phi_min, phi_max, n_phi)
+        V_arr   = self.V(phi_arr)
+        dV_arr  = self.dV(phi_arr)
+        return np.abs(dV_arr) / np.maximum(np.abs(V_arr), 1e-30)
+
+    # ---------- Ω_DE(z) ----------
+    def Omega_DE(self, z):
+        a_t   = 1.0/(1.0+z)
+        idx   = np.argmin(np.abs(self._a - a_t))
+        rho_m = self.H0**2 * self.Om * self._a[idx]**(-3)
+        rho_t = rho_m + self._rho[idx]
+        if rho_t < 1e-30:
+            return 0.0
+        return float(self._rho[idx]/rho_t)
+
+    # ---------- Growth with scale-aware DE clustering (Option B) ----------
+    def compare_growth_LCDM(self, a_lo=0.01, a_hi=1.0, n=800,
+                            k_lin=0.1,  # proxy for ~0.1 h/Mpc linear band
+                            eta=1.0,    # threshold factor for k vs k_J
+                            kappa=1.0): # amplitude of clustering correction
+        """
+        Solve growth for TAFA vs ΛCDM.
+        - Introduces a scale-aware switch S(a) that turns on DE clustering
+          below the DE sound horizon (k > eta * k_J(a), with k_J ~ a H / c_s).
+        - 'k_lin', 'eta', 'kappa' are mild knobs; keep conservative values.
+        """
+        a_grid = np.linspace(a_lo, a_hi, n)
+        H_tafa = np.interp(a_grid, self._a, self._H)
+
+        lna  = np.log(a_grid)
+        lnH  = np.log(np.maximum(H_tafa, 1e-30))
+        dlnH = np.gradient(lnH, lna)
+
+        # Background fractions on this grid
+        H0, Om0 = self.H0, self.Om
+        idx  = np.searchsorted(self._a, a_grid, side='left')
+        idx  = np.clip(idx, 0, len(self._a)-1)
+        rho_phi_grid = self._rho[idx]
+        rho_m_grid   = (H0**2)*Om0 * a_grid**(-3)
+        rho_tot_grid = rho_m_grid + rho_phi_grid
+        Omega_phi_a  = rho_phi_grid / np.maximum(rho_tot_grid, 1e-30)
+
+        # --- DE sound-horizon proxy k_J ~ a H / c_s ---
+        kJ = (a_grid * np.maximum(H_tafa, 1e-30)) / np.sqrt(self.cs2)
+
+        # Smooth switch S(a): ~1 when k_lin > eta kJ (i.e., below DE sound horizon), else ~0.
+        # Logistic with slope=8 for a sharp but smooth transition.
+        S = 1.0 / (1.0 + np.exp(-8.0 * (k_lin/(np.maximum(eta*kJ,1e-30)) - 1.0)))
+
+        # Base clustering factor for finite cs2 (capped mildly)
+        base = 1.0 + kappa * max(0.0, (1.0 - self.cs2)) * Omega_phi_a
+        base = np.minimum(base, 1.0 + 0.5*Omega_phi_a)  # soft cap
+        clustering = 1.0 + S * (base - 1.0)
+
+        # Growth ODE: D'' + A(a) D' + B(a) D = 0
+        A = (3.0 + dlnH) / a_grid
+        B_smooth = -1.5 * Om0 * (H0**2) / (a_grid**5 * np.maximum(H_tafa, 1e-30)**2)
+        B = clustering * B_smooth
+
+        def dDda(a, y):
+            A_i = np.interp(a, a_grid, A)
+            B_i = np.interp(a, a_grid, B)
+            return [y[1], -A_i*y[1] - B_i*y[0]]
+
+        sol = solve_ivp(dDda, (a_lo, a_hi), [a_lo, 1.0],
+                        method='Radau', rtol=1e-9, atol=1e-11,
+                        t_eval=[a_hi])
+        D_tafa = float(sol.y[0, -1])
+
+        # Reference ΛCDM (same H0, Ωm0)
+        H_lcdm = H0*np.sqrt(Om0*a_grid**(-3) + (1.0-Om0))
+        lnH_L  = np.log(H_lcdm)
+        dlnH_L = np.gradient(lnH_L, lna)
+        A_L = (3.0 + dlnH_L)/a_grid
+        B_L = -1.5 * Om0 * (H0**2) / (a_grid**5 * H_lcdm**2)
+
+        def dDda_L(a, y):
+            A_i = np.interp(a, a_grid, A_L)
+            B_i = np.interp(a, a_grid, B_L)
+            return [y[1], -A_i*y[1] - B_i*y[0]]
+
+        solL = solve_ivp(dDda_L, (a_lo, a_hi), [a_lo, 1.0],
+                         method='Radau', rtol=1e-9, atol=1e-11,
+                         t_eval=[a_hi])
+        D_lcdm = float(solL.y[0, -1])
+
+        dev = abs(D_tafa - D_lcdm) / max(abs(D_lcdm), 1e-30)
+
+        # --- Log stability + clustering diagnostics ---
+        self._stability = {
+            "cs2": self.cs2,
+            "ghost_free": (self.cs2 > 0.0),
+            "grad_stable": (self.cs2 > 0.0),
+            "S_min": float(np.min(S)),
+            "S_med": float(np.median(S)),
+            "S_max": float(np.max(S)),
+            "clustering_min": float(np.min(clustering)),
+            "clustering_med": float(np.median(clustering)),
+            "clustering_max": float(np.max(clustering)),
+        }
+        return float(dev)
+
+    # ---------- χ² vs. CPL target ----------
+    def compute_chi2(self, target=None):
+        if target is None:
+            target = {"w0": -0.906, "wa": 0.06}
+        w0, wa = self.compute_cpl()
+        dw0, dwa = w0 - target["w0"], wa - target["wa"]
+        return float((dw0/0.05)**2 + (dwa/0.15)**2)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def safe_float(x):
+    try:
+        return float(np.array(x).reshape(-1)[0])
+    except Exception:
+        return None
+
+def summarize_array(x):
+    x = np.asarray(x, dtype=float).ravel()
+    return {
+        "min":    float(np.min(x)),
+        "p16":    float(np.percentile(x, 16)),
+        "median": float(np.median(x)),
+        "p84":    float(np.percentile(x, 84)),
+        "max":    float(np.max(x)),
+        "mean":   float(np.mean(x)),
+        "std":    float(np.std(x)),
+    }
+
+@dataclass
+class TestResult:
+    name:    str
+    success: bool
+    details: Dict[str, Any]
+    error:   Optional[str] = None
+
+
+# ============================================================
+# AUDITOR
+# ============================================================
+
+class TAFAConsistencyAuditor:
+
+    def __init__(self, model_class, fiducial_params,
+                 random_seed=42):
+        self.model_class = model_class
+        self.fid         = dict(fiducial_params)
+        self.rng         = np.random.default_rng(random_seed)
+        self.results     = {
+            "fiducial": dict(fiducial_params),
+            "tests":    []
+        }
+
+    def _build(self, params):
+        return self.model_class(**params)
+
+    def _record(self, r: TestResult):
+        self.results["tests"].append(asdict(r))
+
+    def run_background_fit(self):
+        name = "background_cpl"
+        try:
+            m      = self._build(self.fid)
+            w0, wa = m.compute_cpl()
+            details = {"w0": float(w0), "wa": float(wa)}
+            self.results["w0"] = float(w0)
+            self.results["wa"] = float(wa)
+            self._record(TestResult(name, True, details))
+            return details
+        except Exception:
+            self._record(TestResult(
+                name, False, {},
+                error=traceback.format_exc()))
+            return None
+
+    def stress_test_fiducial(self, n_perturbations=200,
+                              sigma=0.05,
+                              param_subset=None,
+                              enforce_positive=None,
+                              clip_bounds=None):
+        name = "stress_test_fiducial"
+        try:
+            if param_subset     is None:
+                param_subset = list(self.fid.keys())
+            if enforce_positive is None:
+                enforce_positive = []
+            if clip_bounds      is None:
+                clip_bounds = {}
+
+            samples  = []
+            failures = 0
+
+            for _ in range(n_perturbations):
+                p = self.fid.copy()
+                for k in param_subset:
+                    p[k] = self.fid[k] * (
+                        1.0 + sigma * self.rng.standard_normal()
+                    )
+                    if k in enforce_positive:
+                        p[k] = abs(p[k])
+                    if k in clip_bounds:
+                        lo, hi = clip_bounds[k]
+                        p[k]   = min(max(p[k], lo), hi)
+                try:
+                    m      = self._build(p)
+                    w0, wa = m.compute_cpl()
+                    samples.append((float(w0), float(wa)))
+                except Exception:
+                    failures += 1
+
+            arr = np.array(samples) if samples else np.empty((0,2))
+            details = {
+                "n_success":    int(len(samples)),
+                "n_fail":       int(failures),
+                "failure_rate": float(
+                    failures / max(n_perturbations, 1)),
+                "mean_w0": float(np.mean(arr[:,0]))
+                           if len(arr) else None,
+                "std_w0":  float(np.std(arr[:,0]))
+                           if len(arr) else None,
+                "mean_wa": float(np.mean(arr[:,1]))
+                           if len(arr) else None,
+                "std_wa":  float(np.std(arr[:,1]))
+                           if len(arr) else None,
+                "samples": samples[:20],
+            }
+            self.results["stress"] = details
+            self._record(TestResult(name, True, details))
+            return details
+        except Exception:
+            self._record(TestResult(
+                name, False, {},
+                error=traceback.format_exc()))
+            return None
+
+    def scan_ridge(self, f_range=(0.3, 0.9),
+                   L_range=(0.5, 2.0),
+                   n_f=20, n_L=20,
+                   chi2_threshold=6.0,
+                   target=None,
+                   fixed_other_params=None):
+        name = "ridge_scan"
+        try:
+            fixed = self.fid.copy()
+            if fixed_other_params:
+                fixed.update(fixed_other_params)
+            if target is None:
+                target = {"w0": -0.906, "wa": 0.06}
+
+            fs      = np.linspace(*f_range, n_f)
+            Ls      = np.linspace(*L_range, n_L)
+            good    = []
+            all_pts = []
+
+            for f in fs:
+                for L in Ls:
+                    p = fixed.copy()
+                    p["f"]       = float(f)
+                    p["Lambda4"] = float(L)
+                    try:
+                        m      = self._build(p)
+                        w0, wa = m.compute_cpl()
+                        chi2   = m.compute_chi2(target=target)
+                        pt = {
+                            "f":       float(f),
+                            "Lambda4": float(L),
+                            "w0":      float(w0),
+                            "wa":      float(wa),
+                            "metric":  float(chi2)
+                        }
+                        all_pts.append(pt)
+                        if chi2 <= chi2_threshold:
+                            good.append(pt)
+                    except Exception:
+                        continue
+
+            details = {
+                "n_total":       len(all_pts),
+                "n_good":        len(good),
+                "good_fraction": float(
+                    len(good) / max(len(all_pts), 1)),
+                "good_points":   good[:200],
+            }
+            self.results["ridge"] = details
+            self._record(TestResult(name, True, details))
+            return details
+        except Exception:
+            self._record(TestResult(
+                name, False, {},
+                error=traceback.format_exc()))
+            return None
+
+    def fit_ridge_power_law(self):
+        name = "ridge_power_law_fit"
+        try:
+            pts = self.results.get(
+                "ridge", {}).get("good_points", [])
+            if len(pts) < 3:
+                raise ValueError("Need 3 or more ridge points.")
+            f  = np.array([p["f"]       for p in pts],
+                          dtype=float)
+            L  = np.array([p["Lambda4"] for p in pts],
+                          dtype=float)
+            x  = np.log(f)
+            y  = np.log(L)
+            c  = np.polyfit(x, y, 1)
+            n  = float(c[0])
+            A  = float(np.exp(c[1]))
+            yp = np.polyval(c, x)
+            ss_res = float(np.sum((y - yp)**2))
+            ss_tot = float(np.sum((y - np.mean(y))**2))
+            r2 = (1.0 - ss_res / ss_tot
+                  if ss_tot > 0 else float('nan'))
+            details = {
+                "A": A, "n": n,
+                "R2": r2, "n_points": len(pts)
+            }
+            self.results["ridge_power_law"] = details
+            self._record(TestResult(name, True, details))
+            return details
+        except Exception:
+            self._record(TestResult(
+                name, False, {},
+                error=traceback.format_exc()))
+            return None
+
+    def compute_swampland_margins(self,
+                                   c_values=None,
+                                   on="fiducial"):
+        if c_values is None:
+            c_values = [0.1, 0.3, 1.0]
+        name = "swampland_margins"
+        try:
+            values = []
+            if on == "fiducial":
+                m      = self._build(self.fid)
+                g      = np.asarray(
+                    m.grad_over_V(), dtype=float).ravel()
+                values = g.tolist()
+            elif on == "ridge":
+                pts = self.results.get(
+                    "ridge", {}).get("good_points", [])
+                if not pts:
+                    raise ValueError(
+                        "Run scan_ridge() first.")
+                for p0 in pts:
+                    p = self.fid.copy()
+                    p["f"]       = p0["f"]
+                    p["Lambda4"] = p0["Lambda4"]
+                    m  = self._build(p)
+                    g  = np.asarray(
+                        m.grad_over_V(),
+                        dtype=float).ravel()
+                    values.append(float(np.median(g)))
+            else:
+                raise ValueError(
+                    "on must be fiducial or ridge")
+
+            vals          = np.asarray(values, dtype=float)
+            pass_fraction = {
+                str(c): float(np.mean(vals >= c))
+                for c in c_values
+            }
+            details = {
+                "on":            on,
+                "summary":       summarize_array(vals),
+                "pass_fraction": pass_fraction,
+            }
+            key = "swampland_" + on
+            self.results[key] = details
+            self._record(TestResult(name, True, details))
+            return details
+        except Exception:
+            self._record(TestResult(
+                name, False, {},
+                error=traceback.format_exc()))
+            return None
+
+    def check_early_DE(self, z_rec=1100.0, z_bbn=1e9):
+        name = "early_dark_energy"
+        try:
+            m      = self._build(self.fid)
+            Om_rec = float(m.Omega_DE(z_rec))
+            Om_bbn = float(m.Omega_DE(z_bbn))
+            details = {
+                "Omega_DE_rec": Om_rec,
+                "Omega_DE_BBN": Om_bbn,
+                "z_rec": z_rec,
+                "z_bbn": z_bbn,
+            }
+            self.results["early_DE"] = details
+            self._record(TestResult(name, True, details))
+            return details
+        except Exception:
+            self._record(TestResult(
+                name, False, {},
+                error=traceback.format_exc()))
+            return None
+
+    def check_growth(self, **kwargs):
+        """
+        kwargs forwarded to compare_growth_LCDM (e.g., k_lin, eta, kappa).
+        """
+        name = "growth_consistency"
+        try:
+            m       = self._build(self.fid)
+            dev     = m.compare_growth_LCDM(**kwargs)
+            details = {"growth_dev": safe_float(dev)}
+            # Attach last stability diagnostics if present
+            st = getattr(m, "_stability", {})
+            if st:
+                details.update(st)
+            self.results["growth"] = details
+            self._record(TestResult(name, True, details))
+            return details
+        except Exception:
+            self._record(TestResult(
+                name, False, {},
+                error=traceback.format_exc()))
+            return None
+
+    def save_report(self, filename="tafa_audit_report.json"):
+        with open(filename, "w") as fh:
+            json.dump(self.results, fh, indent=2)
+        return filename
+
+    def summary(self):
+        return self.results
+
+
+# ============================================================
+# PLOTS
+# ============================================================
+
+def plot_background(report):
+    fid = report.get("fiducial", {})
+    m   = TAFAAxion(**fid)
+    w0, wa = m.compute_cpl()
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+    axes[0].plot(m._z, m._phi / (np.pi * m.f),
+                 color='purple', lw=2)
+    axes[0].set_xlabel("z")
+    axes[0].set_ylabel("phi / (pi f)")
+    axes[0].set_title("Field evolution")
+    axes[0].set_xscale('log')
+    axes[0].invert_xaxis()
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(m._z, m._rho,
+                 color='steelblue', lw=2, label='rho_DE')
+    axes[1].set_xlabel("z")
+    axes[1].set_ylabel("rho_phi")
+    axes[1].set_title("Dark energy density")
+    axes[1].set_xscale('log')
+    axes[1].set_yscale('log')
+    axes[1].invert_xaxis()
+    axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+
+    axes[2].plot(m._z, m._w,
+                 color='darkorange', lw=2)
+    axes[2].axhline(-1, color='k', ls='--',
+                    alpha=0.5, label='w=-1')
+    axes[2].axhspan(-0.95, -0.85, alpha=0.15,
+                    color='salmon', label='DESI 1sigma')
+    axes[2].set_xlabel("z")
+    axes[2].set_ylabel("w(z)")
+    axes[2].set_title("Equation of state")
+    axes[2].set_xscale('log')
+    axes[2].set_ylim(-1.5, 0.5)
+    axes[2].invert_xaxis()
+    axes[2].legend()
+    axes[2].grid(True, alpha=0.3)
+
+    plt.suptitle(
+        "TAFA Background  f=" + str(fid.get("f")) +
+        "  L4=" + str(fid.get("Lambda4")) +
+        "  phi0_pi=" + str(fid.get("phi0_pi")) +
+        "  cs2=" + str(fid.get("cs2", '')) +
+        "  w0=" + str(round(w0, 3)) +
+        "  wa=" + str(round(wa, 3)),
+        fontsize=10
+    )
+    plt.tight_layout()
+    plt.savefig("tafa_background.png",
+                dpi=130, bbox_inches='tight')
+    plt.show()
+    print("  Background: w0=" + str(round(w0, 4)) +
+          "  wa=" + str(round(wa, 4)))
+
+
+def plot_potential(report):
+    fid = report.get("fiducial", {})
+    m   = TAFAAxion(**fid)
+
+    phi_arr = np.linspace(
+        -0.9 * np.pi * m.f,
+         0.9 * np.pi * m.f,
+        500
+    )
+    V_tan  = m.V(phi_arr)
+    V_cos  = m.Lambda4 * (1 - np.cos(phi_arr / m.f))
+
+    plt.figure(figsize=(7, 4))
+    plt.plot(phi_arr / (np.pi * m.f), V_tan,
+             lw=2.5, color='darkorange',
+             label='TAFA: tan^2(phi/2f)'
+                   + (f' (soft_alpha={m.soft_alpha})' if m.soft_alpha > 0 else ''))
+    plt.plot(phi_arr / (np.pi * m.f), V_cos,
+             lw=2.5, color='steelblue',
+             ls='--', label='TIFA: 1-cos(phi/f)')
+    plt.axvline(-1, color='red', ls=':', alpha=0.6,
+                label='wall at phi = +/-pi*f')
+    plt.axvline(1, color='red', ls=':', alpha=0.6)
+    plt.xlabel("phi / (pi f)")
+    plt.ylabel("V(phi) / Lambda4")
+    plt.title("Potential comparison: TAFA vs TIFA")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("tafa_potential.png",
+                dpi=130, bbox_inches='tight')
+    plt.show()
+
+
+def plot_stress(report):
+    stress = None
+    for t in report["tests"]:
+        if (t["name"] == "stress_test_fiducial"
+                and t["success"]):
+            stress = t["details"]
+            break
+    if not stress:
+        print("No stress test data.")
+        return
+
+    samples = np.array(stress["samples"], dtype=float)
+    if len(samples) == 0:
+        print("No stress samples.")
+        return
+
+    fig, ax = plt.subplots(1, 2, figsize=(10, 4))
+    ax[0].hist(samples[:, 0], bins=20,
+               alpha=0.8, color='steelblue')
+    ax[0].axvline(report.get("w0", 0),
+                  color='red', lw=2, label='fiducial')
+    ax[0].axvspan(-0.95, -0.85, alpha=0.2,
+                  color='salmon', label='DESI 1sigma')
+    ax[0].set_xlabel("w0")
+    ax[0].set_ylabel("count")
+    ax[0].set_title("Stress test: w0")
+    ax[0].legend()
+
+    ax[1].hist(samples[:, 1], bins=20,
+               alpha=0.8, color='darkorange')
+    ax[1].axvline(report.get("wa", 0),
+                  color='red', lw=2, label='fiducial')
+    ax[1].set_xlabel("wa")
+    ax[1].set_ylabel("count")
+    ax[1].set_title("Stress test: wa")
+    ax[1].legend()
+
+    plt.tight_layout()
+    plt.savefig("tafa_stress.png",
+                dpi=130, bbox_inches='tight')
+    plt.show()
+
+
+def plot_ridge(report):
+    ridge = report.get("ridge", {})
+    pts   = ridge.get("good_points", [])
+    if not pts:
+        print("No ridge points to plot.")
+        return
+
+    f = np.array([p["f"]       for p in pts], dtype=float)
+    L = np.array([p["Lambda4"] for p in pts], dtype=float)
+    m = np.array([p["metric"]  for p in pts], dtype=float)
+
+    plt.figure(figsize=(6, 5))
+    sc = plt.scatter(f, L, c=m,
+                     cmap='viridis_r', s=40, alpha=0.9)
+    plt.colorbar(sc, label='chi2')
+
+    if "ridge_power_law" in report:
+        A  = report["ridge_power_law"]["A"]
+        n  = report["ridge_power_law"]["n"]
+        r2 = report["ridge_power_law"]["R2"]
+        ff = np.linspace(f.min(), f.max(), 200)
+        plt.plot(ff, A * ff**n, lw=2.5, color='red',
+                 label="L4=" + str(round(A, 3)) +
+                       " f^" + str(round(n, 3)) +
+                       "  R2=" + str(round(r2, 3)))
+        plt.legend()
+
+    plt.xlabel("f")
+    plt.ylabel("Lambda4")
+    plt.title("TAFA Ridge: viable (f, Lambda4) region")
+    plt.tight_layout()
+    plt.savefig("tafa_ridge.png",
+                dpi=130, bbox_inches='tight')
+    plt.show()
+
+
+# ============================================================
+# OPTIONAL: CS2 SWEEP
+# ============================================================
+
+def sweep_cs2(auditor, cs2_values=(0.95, 0.90, 0.85, 0.80, 0.75),
+              k_lin=0.1, eta=1.0, kappa=1.0, csv_name="tafa_cs2_sweep_scaleaware.csv"):
+    """
+    Runs a small scan over cs2 and writes (cs2, w0, wa, growth_dev, diagnostics) to CSV.
+    """
+    import csv
+    rows = [("cs2", "w0", "wa", "growth_dev",
+             "S_min", "S_med", "S_max",
+             "clust_min", "clust_med", "clust_max")]
+    base = auditor.fid.copy()
+    best = None
+
+    for cs in cs2_values:
+        p = base.copy()
+        p["cs2"] = float(cs)
+        m = auditor._build(p)
+        w0, wa = m.compute_cpl()
+        dev = m.compare_growth_LCDM(k_lin=k_lin, eta=eta, kappa=kappa)
+
+        st = getattr(m, "_stability", {})
+        rows.append((
+            cs, w0, wa, dev,
+            st.get("S_min", np.nan), st.get("S_med", np.nan), st.get("S_max", np.nan),
+            st.get("clustering_min", np.nan), st.get("clustering_med", np.nan), st.get("clustering_max", np.nan)
+        ))
+
+        if (best is None) or (dev < best[-1]):
+            best = (cs, w0, wa, dev)
+
+    with open(csv_name, "w", newline="") as fh:
+        csv.writer(fh).writerows(rows)
+
+    print("\nCS2 SWEEP SUMMARY (scale-aware)")
+    for r in rows[1:]:
+        print(f"  cs2={r[0]:.2f}  w0={r[1]:+.4f}  wa={r[2]:+.4f}  growth_dev={r[3]:.4f}  "
+              f"S_med={r[5]:.3f}  clust_med={r[8]:.4f}")
+    if best is not None:
+        print(f"\nBest (lowest growth deviation): cs2={best[0]:.2f}  "
+              f"w0={best[1]:+.4f}  wa={best[2]:+.4f}  dev={best[3]:.4f}")
+    print(f"Saved: {csv_name}")
+
+
+# ============================================================
+# FIDUCIAL PARAMETERS
+# ============================================================
+
+fid = {
+    "f":        0.5,
+    "Lambda4":  1.316,
+    "phi0_pi":  0.7,
+    "H0":       67.4,
+    "Omega_m":  0.315,
+    "Gamma0":   0.0,
+    # --- Option B dial (perturbations) ---
+    "cs2":      0.90,
+    # --- Option A (soft-wall) – optional:
+    # "soft_alpha": 0.20
+}
+
+
+# ============================================================
+# AUDIT + PLOTS + SWEEPS (MAIN)
+# ============================================================
+
+class TAFAConsistencyAuditor:
+
+    def __init__(self, model_class, fiducial_params,
+                 random_seed=42):
+        self.model_class = model_class
+        self.fid         = dict(fiducial_params)
+        self.rng         = np.random.default_rng(random_seed)
+        self.results     = {
+            "fiducial": dict(fiducial_params),
+            "tests":    []
+        }
+
+    def _build(self, params):
+        return self.model_class(**params)
+
+    def _record(self, r: TestResult):
+        self.results["tests"].append(asdict(r))
+
+    def run_background_fit(self):
+        name = "background_cpl"
+        try:
+            m      = self._build(self.fid)
+            w0, wa = m.compute_cpl()
+            details = {"w0": float(w0), "wa": float(wa)}
+            self.results["w0"] = float(w0)
+            self.results["wa"] = float(wa)
+            self._record(TestResult(name, True, details))
+            return details
+        except Exception:
+            self._record(TestResult(
+                name, False, {},
+                error=traceback.format_exc()))
+            return None
+
+    def stress_test_fiducial(self, n_perturbations=200,
+                              sigma=0.05,
+                              param_subset=None,
+                              enforce_positive=None,
+                              clip_bounds=None):
+        name = "stress_test_fiducial"
+        try:
+            if param_subset     is None:
+                param_subset = list(self.fid.keys())
+            if enforce_positive is None:
+                enforce_positive = []
+            if clip_bounds      is None:
+                clip_bounds = {}
+
+            samples  = []
+            failures = 0
+
+            for _ in range(n_perturbations):
+                p = self.fid.copy()
+                for k in param_subset:
+                    p[k] = self.fid[k] * (
+                        1.0 + sigma * self.rng.standard_normal()
+                    )
+                    if k in enforce_positive:
+                        p[k] = abs(p[k])
+                    if k in clip_bounds:
+                        lo, hi = clip_bounds[k]
+                        p[k]   = min(max(p[k], lo), hi)
+                try:
+                    m      = self._build(p)
+                    w0, wa = m.compute_cpl()
+                    samples.append((float(w0), float(wa)))
+                except Exception:
+                    failures += 1
+
+            arr = np.array(samples) if samples else np.empty((0,2))
+            details = {
+                "n_success":    int(len(samples)),
+                "n_fail":       int(failures),
+                "failure_rate": float(
+                    failures / max(n_perturbations, 1)),
+                "mean_w0": float(np.mean(arr[:,0]))
+                           if len(arr) else None,
+                "std_w0":  float(np.std(arr[:,0]))
+                           if len(arr) else None,
+                "mean_wa": float(np.mean(arr[:,1]))
+                           if len(arr) else None,
+                "std_wa":  float(np.std(arr[:,1]))
+                           if len(arr) else None,
+                "samples": samples[:20],
+            }
+            self.results["stress"] = details
+            self._record(TestResult(name, True, details))
+            return details
+        except Exception:
+            self._record(TestResult(
+                name, False, {},
+                error=traceback.format_exc()))
+            return None
+
+    def scan_ridge(self, f_range=(0.3, 0.9),
+                   L_range=(0.5, 2.0),
+                   n_f=20, n_L=20,
+                   chi2_threshold=6.0,
+                   target=None,
+                   fixed_other_params=None):
+        name = "ridge_scan"
+        try:
+            fixed = self.fid.copy()
+            if fixed_other_params:
+                fixed.update(fixed_other_params)
+            if target is None:
+                target = {"w0": -0.906, "wa": 0.06}
+
+            fs      = np.linspace(*f_range, n_f)
+            Ls      = np.linspace(*L_range, n_L)
+            good    = []
+            all_pts = []
+
+            for f in fs:
+                for L in Ls:
+                    p = fixed.copy()
+                    p["f"]       = float(f)
+                    p["Lambda4"] = float(L)
+                    try:
+                        m      = self._build(p)
+                        w0, wa = m.compute_cpl()
+                        chi2   = m.compute_chi2(target=target)
+                        pt = {
+                            "f":       float(f),
+                            "Lambda4": float(L),
+                            "w0":      float(w0),
+                            "wa":      float(wa),
+                            "metric":  float(chi2)
+                        }
+                        all_pts.append(pt)
+                        if chi2 <= chi2_threshold:
+                            good.append(pt)
+                    except Exception:
+                        continue
+
+            details = {
+                "n_total":       len(all_pts),
+                "n_good":        len(good),
+                "good_fraction": float(
+                    len(good) / max(len(all_pts), 1)),
+                "good_points":   good[:200],
+            }
+            self.results["ridge"] = details
+            self._record(TestResult(name, True, details))
+            return details
+        except Exception:
+            self._record(TestResult(
+                name, False, {},
+                error=traceback.format_exc()))
+            return None
+
+    def fit_ridge_power_law(self):
+        name = "ridge_power_law_fit"
+        try:
+            pts = self.results.get(
+                "ridge", {}).get("good_points", [])
+            if len(pts) < 3:
+                raise ValueError("Need 3 or more ridge points.")
+            f  = np.array([p["f"]       for p in pts],
+                          dtype=float)
+            L  = np.array([p["Lambda4"] for p in pts],
+                          dtype=float)
+            x  = np.log(f)
+            y  = np.log(L)
+            c  = np.polyfit(x, y, 1)
+            n  = float(c[0])
+            A  = float(np.exp(c[1]))
+            yp = np.polyval(c, x)
+            ss_res = float(np.sum((y - yp)**2))
+            ss_tot = float(np.sum((y - np.mean(y))**2))
+            r2 = (1.0 - ss_res / ss_tot
+                  if ss_tot > 0 else float('nan'))
+            details = {
+                "A": A, "n": n,
+                "R2": r2, "n_points": len(pts)
+            }
+            self.results["ridge_power_law"] = details
+            self._record(TestResult(name, True, details))
+            return details
+        except Exception:
+            self._record(TestResult(
+                name, False, {},
+                error=traceback.format_exc()))
+            return None
+
+    def compute_swampland_margins(self,
+                                   c_values=None,
+                                   on="fiducial"):
+        if c_values is None:
+            c_values = [0.1, 0.3, 1.0]
+        name = "swampland_margins"
+        try:
+            values = []
+            if on == "fiducial":
+                m      = self._build(self.fid)
+                g      = np.asarray(
+                    m.grad_over_V(), dtype=float).ravel()
+                values = g.tolist()
+            elif on == "ridge":
+                pts = self.results.get(
+                    "ridge", {}).get("good_points", [])
+                if not pts:
+                    raise ValueError(
+                        "Run scan_ridge() first.")
+                for p0 in pts:
+                    p = self.fid.copy()
+                    p["f"]       = p0["f"]
+                    p["Lambda4"] = p0["Lambda4"]
+                    m  = self._build(p)
+                    g  = np.asarray(
+                        m.grad_over_V(),
+                        dtype=float).ravel()
+                    values.append(float(np.median(g)))
+            else:
+                raise ValueError(
+                    "on must be fiducial or ridge")
+
+            vals          = np.asarray(values, dtype=float)
+            pass_fraction = {
+                str(c): float(np.mean(vals >= c))
+                for c in c_values
+            }
+            details = {
+                "on":            on,
+                "summary":       summarize_array(vals),
+                "pass_fraction": pass_fraction,
+            }
+            key = "swampland_" + on
+            self.results[key] = details
+            self._record(TestResult(name, True, details))
+            return details
+        except Exception:
+            self._record(TestResult(
+                name, False, {},
+                error=traceback.format_exc()))
+            return None
+
+    def check_early_DE(self, z_rec=1100.0, z_bbn=1e9):
+        name = "early_dark_energy"
+        try:
+            m      = self._build(self.fid)
+            Om_rec = float(m.Omega_DE(z_rec))
+            Om_bbn = float(m.Omega_DE(z_bbn))
+            details = {
+                "Omega_DE_rec": Om_rec,
+                "Omega_DE_BBN": Om_bbn,
+                "z_rec": z_rec,
+                "z_bbn": z_bbn,
+            }
+            self.results["early_DE"] = details
+            self._record(TestResult(name, True, details))
+            return details
+        except Exception:
+            self._record(TestResult(
+                name, False, {},
+                error=traceback.format_exc()))
+            return None
+
+    def check_growth(self, **kwargs):
+        """
+        kwargs forwarded to compare_growth_LCDM (e.g., k_lin, eta, kappa).
+        """
+        name = "growth_consistency"
+        try:
+            m       = self._build(self.fid)
+            dev     = m.compare_growth_LCDM(**kwargs)
+            details = {"growth_dev": safe_float(dev)}
+            # Attach last stability diagnostics if present
+            st = getattr(m, "_stability", {})
+            if st:
+                details.update(st)
+            self.results["growth"] = details
+            self._record(TestResult(name, True, details))
+            return details
+        except Exception:
+            self._record(TestResult(
+                name, False, {},
+                error=traceback.format_exc()))
+            return None
+
+    def save_report(self, filename="tafa_audit_report.json"):
+        with open(filename, "w") as fh:
+            json.dump(self.results, fh, indent=2)
+        return filename
+
+    def summary(self):
+        return self.results
+
+
+# Instantiate auditor with the full model
+auditor = TAFAConsistencyAuditor(
+    model_class=TAFAAxion,
+    fiducial_params=fid,
+    random_seed=42
+)
+
+print("=" * 60)
+print("TAFA CONSISTENCY AUDIT")
+print("=" * 60)
+
+# 1. Background / CPL
+print("\n1. Background / CPL fit")
+r1 = auditor.run_background_fit()
+print("   w0 = " + str(round(r1["w0"], 4)) +
+      "   wa = " + str(round(r1["wa"], 4)))
+
+# 2. Stress test
+print("\n2. Stress test (200 perturbations, sigma=5%)")
+r2 = auditor.stress_test_fiducial(
+    n_perturbations=200,
+    sigma=0.05,
+    param_subset=["f", "Lambda4", "phi0_pi", "cs2"],
+    enforce_positive=["f", "Lambda4"],
+    clip_bounds={"phi0_pi": (0.3, 0.93), "cs2": (0.70, 0.95)}
+)
+print("   Success rate : " +
+      str(round((1 - r2["failure_rate"]) * 100, 1)) + "%")
+print("   w0 : " + str(round(r2["mean_w0"], 4)) +
+      " +/- " + str(round(r2["std_w0"], 4)))
+print("   wa : " + str(round(r2["mean_wa"], 4)) +
+      " +/- " + str(round(r2["std_wa"], 4)))
+
+# 3. Ridge scan
+print("\n3. Ridge scan (f, Lambda4)")
+r3 = auditor.scan_ridge(
+    f_range=(0.3, 0.9),
+    L_range=(0.5, 2.0),
+    n_f=20, n_L=20,
+    chi2_threshold=6.0,
+    target={"w0": -0.906, "wa": 0.06}
+)
+print("   Good points   : " + str(r3["n_good"]) +
+      " / " + str(r3["n_total"]))
+print("   Good fraction : " +
+      str(round(r3["good_fraction"] * 100, 1)) + "%")
+
+# 4. Ridge power-law fit
+print("\n4. Ridge power-law fit")
+r4 = auditor.fit_ridge_power_law()
+if r4:
+    print("   Lambda4 = " + str(round(r4["A"], 4)) +
+          " x f^" + str(round(r4["n"], 4)) +
+          "   R2=" + str(round(r4["R2"], 4)))
+else:
+    print("   Not enough points to fit ridge power-law.")
+
+# 5. Swampland margins (fiducial)
+print("\n5. Swampland margins (fiducial)")
+r5a = auditor.compute_swampland_margins(
+    c_values=[0.1, 0.3, 1.0], on="fiducial"
+)
+pf  = r5a["pass_fraction"]
+print("   |dV|/V median : " +
+      str(round(r5a["summary"]["median"], 4)))
+print("   Pass c=0.1    : " +
+      str(round(pf["0.1"] * 100, 1)) + "%")
+print("   Pass c=0.3    : " +
+      str(round(pf["0.3"] * 100, 1)) + "%")
+print("   Pass c=1.0    : " +
+      str(round(pf["1.0"] * 100, 1)) + "%")
+
+# 5b. Swampland margins (ridge)
+print("\n5b. Swampland margins (ridge)")
+r5b = auditor.compute_swampland_margins(
+    c_values=[0.1, 0.3, 1.0], on="ridge"
+)
+if r5b:
+    print("   |dV|/V median on ridge: " +
+          str(round(r5b["summary"]["median"], 4)))
+
+# 6. Early dark energy
+print("\n6. Early dark energy")
+r6 = auditor.check_early_DE(z_rec=1100, z_bbn=1e9)
+print("   Omega_DE at recombination : " +
+      str(r6["Omega_DE_rec"]))
+print("   Omega_DE at BBN           : " +
+      str(r6["Omega_DE_BBN"]))
+
+# 7. Growth consistency (scale-aware; conservative)
+print("\n7. Growth consistency (scale-aware)")
+# You can also try kappa=1.5 if the effect is mild; keep cs2 >= 0.70
+r7 = auditor.check_growth(k_lin=0.1, eta=1.0, kappa=1.0)
+print("   Growth deviation from LCDM: " +
+      str(round(r7["growth_dev"], 4)))
+if "S_med" in r7:
+    print("   Switch S(a):  median=" + str(round(r7["S_med"], 3)) +
+          "  max=" + str(round(r7["S_max"], 3)))
+if "clustering_med" in r7:
+    print("   Clustering:   median=" + str(round(r7["clustering_med"], 4)) +
+          "  max=" + str(round(r7["clustering_max"], 4)))
+
+print("\n" + "=" * 60)
+print("SUMMARY TABLE")
+print("=" * 60)
+print("  w0                  : " + str(round(r1["w0"], 4)))
+print("  wa                  : " + str(round(r1["wa"], 4)))
+print("  Stress success rate : " +
+      str(round((1 - r2["failure_rate"]) * 100, 1)) + "%")
+print("  Ridge good fraction : " +
+      str(round(r3["good_fraction"] * 100, 1)) + "%")
+if r4:
+    print("  Ridge law           : Lambda4 = " +
+          str(round(r4["A"], 3)) + " f^" +
+          str(round(r4["n"], 3)))
+print("  Swampland median    : " +
+      str(round(r5a["summary"]["median"], 4)))
+print("  Omega_DE(z_rec)     : " + str(r6["Omega_DE_rec"]))
+print("  Growth dev LCDM     : " +
+      str(round(r7["growth_dev"], 4)))
+print("=" * 60)
+
+fn = auditor.save_report("tafa_audit_report.json")
+print("\nReport saved to: " + fn)
+
+print("\nGenerating plots...")
+plot_potential(auditor.summary())
+plot_background(auditor.summary())
+plot_stress(auditor.summary())
+plot_ridge(auditor.summary())
+print("\nDone.")
+
+# --- Optional: run an immediate cs2 sweep (comment out if not needed) ---
+print("\nRunning CS2 sweep (scale-aware)...")
+sweep_cs2(auditor,
+          cs2_values=(0.95, 0.90, 0.85, 0.80, 0.75),
+          k_lin=0.1, eta=1.0, kappa=1.0,
+          csv_name="tafa_cs2_sweep_scaleaware.csv")
